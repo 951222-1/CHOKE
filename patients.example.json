@@ -1,0 +1,19 @@
+{
+  "_note": "Copy this file to patients.json and edit. patients.json is gitignored (personal data).",
+  "A_Grandma": {
+    "name": "Grandma-A",
+    "MAR_OPEN_THRESHOLD": 0.15,
+    "MAR_CLOSE_THRESHOLD": 0.06,
+    "MAX_CHEW_TIME": 4.0,
+    "CHEW_WAVE_THRESHOLD": 2.0,
+    "SWALLOW_STILL_THRESHOLD": 0.8
+  },
+  "B_Grandpa": {
+    "name": "Grandpa-B",
+    "MAR_OPEN_THRESHOLD": 0.18,
+    "MAR_CLOSE_THRESHOLD": 0.07,
+    "MAX_CHEW_TIME": 5.0,
+    "CHEW_WAVE_THRESHOLD": 2.2,
+    "SWALLOW_STILL_THRESHOLD": 0.9
+  }
+}

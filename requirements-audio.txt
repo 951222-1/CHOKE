@@ -1,0 +1,10 @@
+# Anti-Choking Monitor v4.2 - AUDIO module (optional, YAMNet sound detection).
+# Large download (tensorflow wheel is ~350 MB). If this fails or is skipped,
+# the program still runs in VISION-ONLY mode by design.
+# NOTE: tensorflow-hub depends on tf-keras -> tensorflow, so both belong
+#       together here and must NOT be mixed into the core resolver pass.
+tensorflow
+tensorflow-hub
+# tensorflow-hub imports pkg_resources, which setuptools>=81 removed.
+# Pin setuptools so the audio module does not silently fail (AUDIO_AVAILABLE=False).
+setuptools<81

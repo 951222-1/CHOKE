@@ -1,0 +1,10 @@
+# Anti-Choking Monitor v4.2 - CORE dependencies (vision mode).
+# These are enough to run the system in vision-only mode.
+# NOTE: cv2 (OpenCV) is pulled in automatically by mediapipe
+#       (as opencv-contrib-python), so it is NOT listed separately
+#       to avoid an opencv-python vs opencv-contrib-python clash.
+mediapipe
+numpy
+requests
+sounddevice
+soundfile

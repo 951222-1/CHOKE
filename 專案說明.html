@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>防哽咽即時監測系統 — 專案說明</title>
+<style>
+  :root{
+    --bg:#eef1f2; --panel:#f8fafa; --ink:#17242b; --muted:#586a71;
+    --accent:#0e7c86; --accent-soft:#0e7c8618; --alert:#c0392b;
+    --line:#cdd6d9; --code-bg:#0f1c21; --code-ink:#d6e6e6;
+    --measure:38rem;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0e181c; --panel:#14232a; --ink:#e6eef0; --muted:#93a7ad;
+      --accent:#3bb3bd; --accent-soft:#3bb3bd1f; --alert:#e2695c;
+      --line:#274049; --code-bg:#0a1418; --code-ink:#cfe4e4;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f2; --panel:#f8fafa; --ink:#17242b; --muted:#586a71;
+    --accent:#0e7c86; --accent-soft:#0e7c8618; --alert:#c0392b;
+    --line:#cdd6d9; --code-bg:#0f1c21; --code-ink:#d6e6e6;
+  }
+  :root[data-theme="dark"]{
+    --bg:#0e181c; --panel:#14232a; --ink:#e6eef0; --muted:#93a7ad;
+    --accent:#3bb3bd; --accent-soft:#3bb3bd1f; --alert:#e2695c;
+    --line:#274049; --code-bg:#0a1418; --code-ink:#cfe4e4;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:Georgia,"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif;
+    line-height:1.7; font-size:17px;
+  }
+  .wrap{max-width:44rem; margin:0 auto; padding:clamp(1.4rem,4vw,3.5rem) 1.4rem 5rem}
+  .mono{font-family:ui-monospace,"Cascadia Code",Consolas,"Microsoft JhengHei",monospace}
+  .eyebrow{
+    font-family:ui-monospace,Consolas,"Microsoft JhengHei",monospace;
+    font-size:.72rem; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 .9rem;
+  }
+  h1{
+    font-size:clamp(1.9rem,6vw,2.9rem); line-height:1.12; margin:0 0 .5rem;
+    font-weight:700; letter-spacing:-.01em; text-wrap:balance;
+  }
+  .dek{font-size:1.12rem; color:var(--muted); margin:0 0 1.6rem; max-width:var(--measure)}
+  .readout{
+    display:flex; flex-wrap:wrap; gap:.5rem .5rem; margin:0 0 2.4rem; padding:0;
+    list-style:none;
+  }
+  .readout li{
+    font-family:ui-monospace,Consolas,monospace; font-size:.78rem;
+    border:1px solid var(--line); border-radius:2px; padding:.32rem .6rem;
+    color:var(--muted); background:var(--panel);
+  }
+  .readout b{color:var(--ink); font-weight:700}
+  section{
+    max-width:var(--measure); border-left:2px solid var(--line);
+    padding-left:1.4rem; margin:2.9rem 0;
+  }
+  h2{
+    font-size:1.35rem; margin:0 0 .2rem; font-weight:700; letter-spacing:-.01em;
+    text-wrap:balance;
+  }
+  h2 .num{
+    font-family:ui-monospace,Consolas,monospace; font-size:.8rem; color:var(--accent);
+    margin-right:.55rem; vertical-align:.12em;
+  }
+  h2+.sub{color:var(--muted); font-size:.92rem; margin:.1rem 0 1rem}
+  p{margin:.85rem 0}
+  .sig{display:grid; gap:1rem; margin:1.1rem 0}
+  .sig .row{border-top:1px solid var(--line); padding-top:.85rem}
+  .sig .name{font-weight:700}
+  .sig .name .file{
+    font-family:ui-monospace,Consolas,monospace; font-size:.78rem;
+    color:var(--accent); margin-left:.5rem; font-weight:400;
+  }
+  .sig p{margin:.25rem 0 0; color:var(--muted); font-size:.96rem}
+  .diagram{
+    display:grid; gap:.7rem; margin:1.2rem 0; font-size:.9rem;
+  }
+  .node{
+    border:1px solid var(--line); border-radius:3px; background:var(--panel);
+    padding:.75rem .9rem;
+  }
+  .node .role{
+    font-family:ui-monospace,Consolas,monospace; font-size:.7rem;
+    letter-spacing:.1em; text-transform:uppercase; color:var(--accent);
+  }
+  .node .what{color:var(--muted); font-size:.88rem; margin-top:.15rem}
+  .link{
+    text-align:center; color:var(--muted); font-family:ui-monospace,monospace;
+    font-size:.78rem; letter-spacing:.02em;
+  }
+  .callout{
+    background:var(--accent-soft); border:1px solid var(--line);
+    border-left:3px solid var(--accent); border-radius:3px;
+    padding:1rem 1.1rem; margin:1.2rem 0;
+  }
+  .callout p:first-child{margin-top:0}
+  .callout p:last-child{margin-bottom:0}
+  pre{
+    background:var(--code-bg); color:var(--code-ink); border-radius:4px;
+    padding:.85rem 1rem; overflow-x:auto; margin:1rem 0;
+    font-family:ui-monospace,Consolas,monospace; font-size:.82rem; line-height:1.55;
+  }
+  .bad{color:var(--alert)} .good{color:var(--accent)}
+  ol.steps{counter-reset:s; list-style:none; padding:0; margin:1.1rem 0}
+  ol.steps li{
+    counter-increment:s; position:relative; padding:.55rem 0 .55rem 2.4rem;
+    border-top:1px solid var(--line);
+  }
+  ol.steps li::before{
+    content:counter(s); position:absolute; left:0; top:.55rem;
+    font-family:ui-monospace,Consolas,monospace; font-weight:700;
+    color:var(--accent); font-size:1rem;
+  }
+  ol.steps b{font-family:ui-monospace,Consolas,monospace; font-size:.9rem}
+  .fn{color:var(--muted); font-size:.86rem; border-top:1px solid var(--line);
+      margin-top:3rem; padding-top:1rem; max-width:var(--measure)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="eyebrow">教學專案 · 影像 + 聲音 + 嵌入式</p>
+  <h1>防哽咽即時監測系統</h1>
+  <p class="dek">用鏡頭看臉、用麥克風聽聲音,判斷有沒有人在吃東西時噎到。發現可疑就警報。
+    這頁把整個系統怎麼運作、為什麼這樣設計講一遍。</p>
+
+  <ul class="readout">
+    <li><b>3</b> 個裝置協作</li>
+    <li><b>6</b> 種偵測線索</li>
+    <li><b>68</b> 項自動測試通過</li>
+    <li>桌面版 <b>已實跑驗證</b></li>
+  </ul>
+
+  <section>
+    <h2>這是什麼</h2>
+    <p>吃東西噎到、氣管被塞住,幾分鐘內就可能造成缺氧腦傷。照護長輩或小孩時,不可能一直
+      盯著看。這個系統就是想當那雙「不會累的眼睛跟耳朵」,一發現不對就馬上叫人。</p>
+    <p>它不是靠單一招判斷,而是同時看好幾種線索一起下決定 —— 因為任何一種訊號單獨看都會
+      誤判,合起來看才準。這頁下面會一個一個講。</p>
+    <p>你手上這個資料夾是「桌面版」:在一台 Windows 電腦上,用它自己的鏡頭跟麥克風就能跑。</p>
+  </section>
+
+  <section>
+    <h2>它怎麼判斷有人噎到</h2>
+    <p class="sub">六種線索,分別寫在幾個小檔裡,想看演算法從這些檔看最快。</p>
+    <div class="sig">
+      <div class="row">
+        <div class="name">咀嚼狀態機</div>
+        <p>追蹤嘴巴開合跟下巴動作,判斷現在是「張嘴吃 → 咀嚼 → 吞嚥 → 觀察」哪個階段。
+          咀嚼太久沒吞下去,就是可疑訊號。</p>
+      </div>
+      <div class="row">
+        <div class="name">聲音嗆咳 <span class="file">YAMNet</span></div>
+        <p>用 Google 訓練好的聲音辨識模型,聽麥克風有沒有咳嗽、喘、清喉嚨這類聲音。</p>
+      </div>
+      <div class="row">
+        <div class="name">手抓喉嚨 <span class="file">gesture.py</span></div>
+        <p>人噎到會反射性抓自己的喉嚨,這是全世界通用的窒息手勢,可靠度很高。</p>
+      </div>
+      <div class="row">
+        <div class="name">無聲窒息 <span class="file">silent_choke.py</span></div>
+        <p>最危險的一種:氣管完全塞住時,人是發不出聲、也咳不出來的。所以反過來抓
+          「嘴開著、身體不動、又幾乎沒聲音」持續好幾秒。靠聽聲音的方法反而會漏掉這種。</p>
+      </div>
+      <div class="row">
+        <div class="name">嘴唇發紫 <span class="file">cyanosis.py</span></div>
+        <p>缺氧到後期嘴唇會轉青紫。看嘴唇顏色裡藍色佔多少,太高就是真的缺氧的客觀證據。</p>
+      </div>
+      <div class="row">
+        <div class="name">多線索融合 <span class="file">evidence_fusion.py</span></div>
+        <p>把上面的線索收在最近幾秒的「時間窗」裡各給分數加起來,超過門檻才報。這樣不會
+          因為單一訊號抖一下就亂叫,大幅減少誤報。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>三個裝置怎麼分工</h2>
+    <p class="sub">桌面版可以單獨用;嵌入式版是「前哨 + 大腦」兩台一起。</p>
+    <div class="diagram">
+      <div class="node">
+        <div class="role">Windows 桌面版</div>
+        <div class="what">一台電腦全包:影像 + 聲音 + 上面全部的判斷。你這個資料夾就是它。</div>
+      </div>
+      <div class="link">— — — 或是穿戴/床邊的兩台版本 — — —</div>
+      <div class="node">
+        <div class="role">ESP32-S3 前哨</div>
+        <div class="what">小晶片,一直聽麥克風,本地先粗判、先嗶嗶叫(斷網也能自己叫)。</div>
+      </div>
+      <div class="link">↓ WiFi 把聲音串給大腦 · 大腦回傳確認 ↓</div>
+      <div class="node">
+        <div class="role">Raspberry Pi 大腦</div>
+        <div class="what">算力較強,跑完整的聲音模型再確認一次,發 LINE、寫紀錄。</div>
+      </div>
+    </div>
+    <p>好處是「快」跟「準」兼得:前哨反應快,大腦判斷準;而且大腦掛掉時,前哨照樣能自己
+      警報,不會整個系統一起死。</p>
+  </section>
+
+  <section>
+    <h2>為什麼所有 .bat 都避開 cp950</h2>
+    <p>這是這個專案踩過、也修掉的一個真實坑,值得講給你聽,因為很多人會遇到。</p>
+    <p>Windows 繁體中文版的「命令列/終端機」預設用一種叫 <span class="mono">cp950</span>(Big5)的
+      編碼。但我們寫程式習慣用 <span class="mono">UTF-8</span>。這兩種對不上時就會出事 ——
+      尤其是 <span class="mono">.bat</span> 檔裡如果放了中文字或 emoji:</p>
+    <div class="callout">
+      <p><span class="bad">會發生什麼:</span>雙擊 .bat,視窗跳出一堆亂碼,更慘的是有時候
+        「一閃就關」,根本來不及看它在講什麼 —— 因為 cp950 解不了那些 UTF-8 的位元組,
+        直接讓批次檔解析出錯。</p>
+      <p><span class="good">怎麼修:</span>把 .bat 的內容全部寫成純英文(純 ASCII),
+        一個中文、一個 emoji 都不放。ASCII 在任何編碼下都長一樣,所以到哪台電腦都穩。</p>
+    </div>
+    <pre>不穩(中文/emoji 在 cp950 會亂碼、甚至閃退):
+  echo <span class="bad">正在安裝套件...</span>
+
+穩(純英文,到哪都一樣):
+  echo <span class="good">Installing packages...</span></pre>
+    <p>所以你會看到:<b>檔名是中文</b>(讓你一眼看懂順序:1、2、3),但<b>打開後裡面是英文</b>。
+      檔名由 Windows 用 Unicode 存,雙擊沒問題;內容純英文,保證跑得動。這不是偷懶,是刻意
+      為了「換一台電腦也不會壞」。</p>
+    <p>同樣的道理:主程式裡如果 print 中文/emoji,當輸出被導到檔案或被程式擷取時
+      (不是直接顯示在終端機),也會因為 cp950 而報錯。所以測試時我們會先設
+      <span class="mono">PYTHONIOENCODING=utf-8</span> 把輸出強制成 UTF-8。</p>
+  </section>
+
+  <section>
+    <h2>怎麼在你電腦上跑</h2>
+    <p class="sub">照順序雙擊三個 .bat 就好,第 4 步是實際操作。</p>
+    <ol class="steps">
+      <li><b>1_建立虛擬環境.bat</b> — 幫這個 app 開一個獨立的 Python。只要做一次。</li>
+      <li><b>2_安裝套件.bat</b> — 裝需要的套件。聲音那包(tensorflow)很大,慢慢等它跑完。</li>
+      <li><b>3_啟動系統.bat</b> — 開鏡頭。第一次會下載臉部/聲音模型,等幾秒。</li>
+      <li><b>開始用</b> — 臉上會出現綠點;對麥克風咳一聲,Audio Choke 那條會動;把手靠近
+        喉嚨約一秒會跳窒息警報。看完按 <b>q</b> 關掉。</li>
+    </ol>
+    <p>沒裝到聲音那包也沒關係,程式會自動變成「只看影像」模式,一樣能跑。</p>
+  </section>
+
+  <p class="fn">這是教學/照護輔助用途的專案,<b>不是醫療器材</b>,不能當成唯一的安全依靠。
+    真正照顧人的時候,還是要有人在。</p>
+
+</div>
+</body>
+</html>

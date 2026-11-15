@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import unittest
 
@@ -8,13 +9,17 @@ from l4_safety import (
     ChokeDoubleActionTimer,
     FaceLossWarningGuard,
     ThresholdCrossingGate,
+    build_l4_gmail_email,
     check_continuous_body_shaking,
     count_direction_reversals,
     dispatch_visibility_warning,
     evaluate_l4_candidate,
+    external_notifications_disabled,
+    send_l4_gmail_smtp,
 )
 
 MAIN_SOURCE = Path(__file__).with_name("防哽咽裝置4_2.py").read_text(encoding="utf-8")
+ALERT_DEMO_SOURCE = Path(__file__).with_name("alert_system_demo.py").read_text(encoding="utf-8")
 THRESHOLDS = json.loads(
     (Path(__file__).parent / "shared" / "thresholds.json").read_text(encoding="utf-8")
 )
@@ -166,6 +171,9 @@ class DesktopL4WiringTests(unittest.TestCase):
         self.assertIn("visibility_warning_guard.update(", MAIN_SOURCE)
         self.assertIn("dispatch_visibility_warning(", MAIN_SOURCE)
         self.assertIn("CHOKE_DOUBLE_TRIGGER_SEC = 2.5", MAIN_SOURCE)
+        self.assertIn("CHOKE_DOUBLE_GRACE_SEC = 0.9", MAIN_SOURCE)
+        self.assertIn("CHOKE_DECAY_RATE = 0.25", MAIN_SOURCE)
+        self.assertIn("POST_COUGH_WINDOW_SEC = 12.0", MAIN_SOURCE)
         self.assertIn("last_cough_time = -1e9", MAIN_SOURCE)
         self.assertIn("gesture.danger_zone_geometry(", MAIN_SOURCE)
         self.assertIn("evaluate_l4_candidate(", MAIN_SOURCE)
@@ -192,7 +200,7 @@ class DesktopL4WiringTests(unittest.TestCase):
         self.assertEqual(calls["records"][0][3], "疑似哽噎_視覺遮蔽需確認")
         self.assertNotEqual(calls["records"][0][3], "緊急哽噎警報(雙重動作5秒)")
 
-    def test_sensitivity_profile_thresholds_and_wiring(self):
+    def test_online_parity_thresholds_and_wiring(self):
         self.assertEqual(THRESHOLDS["AUDIO_CHOKE_TH_FUSION"], 0.12)
         self.assertEqual(THRESHOLDS["AUDIO_COUGH_RECORD_TH"], 0.18)
         self.assertEqual(THRESHOLDS["AUDIO_CHOKE_TH_SOLO"], 0.28)
@@ -233,6 +241,110 @@ class DesktopL4WiringTests(unittest.TestCase):
         self.assertGreaterEqual(still, 10.0)
         self.assertTrue(gate.update(still, 10.0))
         self.assertFalse(gate.update(still + 0.25, 10.0))
+
+    def test_sensitivity_body_motion_profile_is_active(self):
+        history = []
+        w, h, face_size = 640, 480, 100.0
+        x_positions_px = [320, 335, 320, 335, 320, 335, 320, 335]
+        result = False
+        for index, x_px in enumerate(x_positions_px):
+            t = index * 0.08
+            result = check_continuous_body_shaking(
+                history, (x_px / w, 0.50), face_size, t, w, h
+            )
+        self.assertTrue(result)
+
+    def test_external_gmail_gate_is_fail_closed_for_test_and_demo(self):
+        env_name = "ANTICHOKE_DISABLE_EXTERNAL_NOTIFICATIONS"
+        previous = os.environ.get(env_name)
+        os.environ[env_name] = "1"
+        try:
+            self.assertTrue(external_notifications_disabled())
+            self.assertFalse(
+                send_l4_gmail_smtp(
+                    message="test",
+                    sender="sender@gmail.com",
+                    app_password="abcd efgh ijkl mnop",
+                    recipient="caregiver@gmail.com",
+                    smtp_factory=AssertionError,
+                )
+            )
+            self.assertIn("confirmed_l4=False", ALERT_DEMO_SOURCE)
+            self.assertIn("if confirmed_l4:", ALERT_DEMO_SOURCE)
+            self.assertIn("if not confirmed_l4 or alert_type !=", ALERT_DEMO_SOURCE)
+            self.assertIn("confirmed_l4=True", ALERT_DEMO_SOURCE)
+            self.assertIn("external_notifications_disabled", ALERT_DEMO_SOURCE)
+        finally:
+            if previous is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous
+
+    def test_l4_only_gmail_notification_and_no_line_legacy(self):
+        self.assertIn("GMAIL_SENDER", THRESHOLDS)
+        self.assertIn("GMAIL_APP_PASSWORD", THRESHOLDS)
+        self.assertIn("GMAIL_RECIPIENT", THRESHOLDS)
+        self.assertEqual(THRESHOLDS["GMAIL_SMTP_HOST"], "smtp.gmail.com")
+        self.assertEqual(THRESHOLDS["GMAIL_SMTP_PORT"], 465)
+
+        self.assertIn("send_gmail_notification(", MAIN_SOURCE)
+        self.assertIn('if alert_type != "choke_emergency":', MAIN_SOURCE)
+        self.assertIn("external_notifications_disabled()", MAIN_SOURCE)
+        self.assertIn("speed_sum_threshold=BODY_SHAKE_SPEED_SUM_TH", MAIN_SOURCE)
+        self.assertNotIn("send_line_notification", MAIN_SOURCE)
+        self.assertNotIn("LINE_TOKEN", MAIN_SOURCE)
+
+        # Visibility warning with send_notification=None only pops up locally & logs
+        calls = {"popup": [], "records": []}
+        dispatch_visibility_warning(
+            None,
+            lambda t, m: calls["popup"].append((t, m)),
+            lambda pid, name, c, st: calls["records"].append((pid, name, c, st)),
+            "P001", "王阿嬤", 8,
+        )
+        self.assertEqual(len(calls["popup"]), 1)
+        self.assertEqual(len(calls["records"]), 1)
+
+        # Test Gmail message construction and SMTP dispatch
+        sent = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=10):
+                self.host = host
+                self.port = port
+                self.logged_in = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def login(self, user, password):
+                self.logged_in = (user, password)
+
+            def send_message(self, msg):
+                sent.append((self.host, self.port, self.logged_in, msg))
+
+        ok = send_l4_gmail_smtp(
+            message="🚨【緊急・哽噎警報】偵測到「雙手同時抓喉/撫胸窒息手勢」累計達標！",
+            sender="sender@gmail.com",
+            app_password="abcd efgh ijkl mnop",
+            recipient="caregiver@gmail.com",
+            patient_name="王阿嬤",
+            smtp_factory=FakeSMTP,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+        host, port, creds, email_msg = sent[0]
+        self.assertEqual(host, "smtp.gmail.com")
+        self.assertEqual(port, 465)
+        self.assertEqual(creds, ("sender@gmail.com", "abcdefghijklmnop"))
+        self.assertEqual(email_msg["Subject"], "L4 進食安全提醒")
+        self.assertEqual(email_msg["From"], "sender@gmail.com")
+        self.assertEqual(email_msg["To"], "caregiver@gmail.com")
+        self.assertIn("王阿嬤", email_msg.get_content())
+        self.assertIn("L4（急性哽噎緊急警報）", email_msg.get_content())
 
 
 if __name__ == "__main__":

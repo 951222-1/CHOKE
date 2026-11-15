@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared detection thresholds aligned with online web version (mobile/app.js & config.js).",
+  "_comment": "Sensitivity-test detection thresholds plus Gmail notification config; use only for controlled demonstration, not clinical use.",
   "AUDIO_CHOKE_TH_FUSION": 0.12,
   "AUDIO_COUGH_RECORD_TH": 0.18,
   "AUDIO_CHOKE_TH_SOLO": 0.28,
@@ -20,5 +20,10 @@
   "W_AUDIO": 2.0,
   "W_GESTURE": 0.6,
   "W_CYANOSIS": 0.7,
-  "GESTURE_CONFIRM_FRAMES": 15
+  "GESTURE_CONFIRM_FRAMES": 15,
+  "GMAIL_SENDER": "",
+  "GMAIL_APP_PASSWORD": "",
+  "GMAIL_RECIPIENT": "",
+  "GMAIL_SMTP_HOST": "smtp.gmail.com",
+  "GMAIL_SMTP_PORT": 465
 }

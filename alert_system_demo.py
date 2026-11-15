@@ -6,19 +6,20 @@
 2. 視覺警報：OpenCV 螢幕紅色閃烁橫幅 (Flashing Banner Overlay)
 3. 聽覺警報：winsound 非阻塞聲音蜂鳴 (Audio Beep)
 4. GUI 彈窗警報：Tkinter 跨執行緒防鎖定跳窗 (Topmost Popup Box)
-5. 遠端推送警報：LINE Notify / Webhook 異步冷卻發送 (Async Line Broadcast)
+5. 遠端推送警報：Gmail SMTP 異步冷卻寄信 (僅限 L4 急性哽噎緊急警報)
 6. 資料庫紀錄：SQLite 警報事件紀錄存檔 (Database Logging)
 7. 完整測試 Main 流程
 """
 
+import json
 import os
 import sys
 import time
 import sqlite3
 import threading
-import requests
 import cv2
 import numpy as np
+from l4_safety import external_notifications_disabled, send_l4_gmail_smtp
 
 # 音效與 GUI 套件相容性檢查
 try:
@@ -74,42 +75,68 @@ class EvidenceFusion:
 
 
 # =============================================================================
-# 2. 遠端 LINE 通報系統 (異步 + 冷卻機制)
+# 2. 遠端 Gmail 通報系統 (僅限 L4 緊急警報，異步 + 冷卻機制)
 # =============================================================================
-class LineAlertSystem:
-    def __init__(self, token=None, cooldown_sec=10.0):
-        self.token = token or os.environ.get("LINE_TOKEN", "")
+class GmailAlertSystem:
+    def __init__(self, sender=None, app_password=None, recipient=None, cooldown_sec=10.0):
+        th_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared", "thresholds.json")
+        th_data = {}
+        if os.path.exists(th_path):
+            try:
+                with open(th_path, "r", encoding="utf-8") as f:
+                    th_data = json.load(f)
+            except Exception:
+                th_data = {}
+        self.sender = (sender or os.environ.get("GMAIL_SENDER") or th_data.get("GMAIL_SENDER") or "").strip()
+        self.app_password = (app_password or os.environ.get("GMAIL_APP_PASSWORD") or th_data.get("GMAIL_APP_PASSWORD") or "").strip()
+        self.recipient = (recipient or os.environ.get("GMAIL_RECIPIENT") or th_data.get("GMAIL_RECIPIENT") or self.sender).strip()
+        self.smtp_host = (os.environ.get("GMAIL_SMTP_HOST") or th_data.get("GMAIL_SMTP_HOST") or "smtp.gmail.com").strip()
+        self.smtp_port = int(os.environ.get("GMAIL_SMTP_PORT") or th_data.get("GMAIL_SMTP_PORT") or 465)
         self.cooldown = cooldown_sec
         self.last_alert_times = {}
 
-    def _worker(self, message):
-        if not self.token:
-            print(f"[LINE 模擬發送]: {message}")
+    def _worker(self, message, subject):
+        if external_notifications_disabled():
+            print("🛑 外部通知已停用，略過 Gmail 示範寄送。")
             return
-        url = "https://api.line.me/v2/bot/message/broadcast"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"}
+        if not self.sender or not self.app_password:
+            print(f"[Gmail 模擬寄送 (未設定 GMAIL_SENDER/GMAIL_APP_PASSWORD)]: {message}")
+            return
         try:
-            res = requests.post(url, json={"messages": [{"type": "text", "text": message}]},
-                                headers=headers, timeout=5)
-            if res.status_code == 200:
-                print("✅ LINE 通報發送成功。")
+            sent = send_l4_gmail_smtp(
+                message=message,
+                sender=self.sender,
+                app_password=self.app_password,
+                recipient=self.recipient,
+                subject=subject,
+                smtp_host=self.smtp_host,
+                smtp_port=self.smtp_port,
+            )
+            if sent:
+                print(f"✅ Gmail L4 緊急通報寄送成功 -> {self.recipient}")
             else:
-                print(f"❌ LINE 發送失敗: {res.status_code}, {res.text}")
+                print("🛑 Gmail 寄送被安全閘門略過。")
         except Exception as e:
-            print(f"❌ LINE 連線失敗: {e}")
+            print(f"❌ Gmail 寄送失敗: {e}")
 
-    def send(self, message, alert_type="general"):
+    def send(self, message, alert_type="choke_emergency", subject="L4 進食安全提醒",
+             confirmed_l4=False):
+        if not confirmed_l4 or alert_type != "choke_emergency":
+            return
+        if external_notifications_disabled():
+            print("🛑 外部通知已停用，略過 Gmail 寄送。")
+            return
         now = time.time()
         if now - self.last_alert_times.get(alert_type, 0) < self.cooldown:
             return  # 在冷卻期內，忽略發送
 
         self.last_alert_times[alert_type] = now
         # 使用背景執行緒發送，避免阻塞主 UI 畫面
-        threading.Thread(target=self._worker, args=(message,), daemon=True).start()
+        threading.Thread(target=self._worker, args=(message, subject), daemon=True).start()
 
 
 # =============================================================================
-# 3. 多重警報管理器 (UI 閃光橫幅 + 蜂鳴 + 彈窗)
+# 3. 多重警報管理器 (UI 閃光橫幅 + 蜂鳴 + 彈窗 + L4 Gmail)
 # =============================================================================
 class AlertManager:
     def __init__(self, db_path="eating_records.db"):
@@ -117,7 +144,7 @@ class AlertManager:
         self.banner_text = ""
         self.popup_lock = threading.Lock()
         self.popup_active = False
-        self.line_system = LineAlertSystem()
+        self.gmail_system = GmailAlertSystem()
         self.db_path = db_path
         self._init_db()
 
@@ -160,21 +187,28 @@ class AlertManager:
         """
         嗆咳事件（原 L1 / L2 合併）：
         取消劇烈晃動條件，僅於背景寫入 SQLite 資料庫（標籤為 嗆咳紀錄），
-        不會跳出 UI 彈窗、不閃紅橫幅、不發出蜂鳴聲與不發送 LINE。
+        不會跳出 UI 彈窗、不閃紅橫幅、不發出蜂鳴聲與不寄送 Gmail。
         """
         title = "嗆咳紀錄"
         print(f"🤫 【後台靜默紀錄】已寫入 SQLite 資料庫 -> 標籤: [{title}], 內容: {message}")
         self.log_to_db(patient_id, title, message)
 
-    def trigger_alert(self, title, message, patient_id="PATIENT_001"):
-        """觸發完整警報：閃光橫幅 + 音效 + 彈窗 + LINE + 資料庫紀錄"""
+    def trigger_alert(self, title, message, patient_id="PATIENT_001", confirmed_l4=False):
+        """觸發本機警報；只有 confirmed_l4=True 才可寄送 Gmail。"""
         print(f"\n🚨 【緊急警報發起】{title}: {message}")
         self.banner_until = time.time() + 4.0  # 橫幅持續 4 秒
         self.banner_text = title
 
-        # 紀錄至資料庫與發送 LINE 通報
+        # 所有候選事件都寫入本機；只有已確認 L4 才能寄送外部 Gmail。
         self.log_to_db(patient_id, title, message)
-        self.line_system.send(f"🚨【{title}】\n{message}")
+        if confirmed_l4:
+            self.gmail_system.send(
+                f"🚨【{title}】\n{message}",
+                alert_type="choke_emergency",
+                confirmed_l4=True,
+            )
+        else:
+            print("ℹ️ 尚未確認 L4：保留本機警報與 SQLite，不寄送 Gmail。")
 
         # 避免同時打開多個 Tkinter 彈窗造成 GUI 死鎖
         with self.popup_lock:
@@ -248,7 +282,8 @@ def main():
         # 檢查是否達到觸發警報條件
         if fusion.check():
             alert_mgr.trigger_alert("窒息多模態融合警報",
-                                   f"綜合多模態分數達 {current_score:.2f} (>= 0.8)，判定為窒息危急狀態！")
+                                   f"綜合多模態分數達 {current_score:.2f} (>= 0.8)，判定為窒息危急狀態！",
+                                   confirmed_l4=False)
 
         # 繪製警報橫幅 (若在警報時間內)
         alert_mgr.draw_alert_banner(frame)

@@ -47,7 +47,7 @@ MODULES = {
     "5": {
         "title": "🚨 多模態警報與證據融合測試模組",
         "file": "alert_system_demo.py",
-        "desc": "測試時域融合評分器 (EvidenceFusion)、OpenCV 閃爍橫幅、蜂鳴聲、GUI 彈窗與 LINE/SQLite。",
+        "desc": "測試時域融合評分器 (EvidenceFusion)、OpenCV 閃爍橫幅、蜂鳴聲、GUI 彈窗與 Gmail/SQLite（未確認 L4 時不寄外部通知）。",
         "tips": "【測試方法】開啟後在鍵盤按下 '1' (聲音)、'2' (手勢)、'3' (發紺) 累積分數測試警報。"
     },
     "6": {

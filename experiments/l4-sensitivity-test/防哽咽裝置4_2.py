@@ -3,7 +3,7 @@
 # 防哽咽即時監測 —— 主程式
 #
 # 這支程式用鏡頭看臉、用麥克風聽聲音,判斷有沒有人在吃東西時噎到。
-# 一發現可疑就警報(畫面紅色橫幅、電腦嗶嗶叫、彈窗、還會發 LINE)。
+# 一發現可疑就警報(畫面紅色橫幅、電腦嗶嗶叫、彈窗;確認 L4 急性哽噎時寄送 Gmail 緊急通知)。
 #
 # 判斷同時看好幾種線索:嘴巴開合、咀嚼、有沒有嗆咳聲(用 Google 的 YAMNet 模型)、
 # 手有沒有抓喉嚨、嘴唇有沒有發紫、以及「安靜卻不動」的無聲窒息。這些線索分別在
@@ -69,7 +69,8 @@ print("✅ 核心套件檢查通過。" + ("🎤 聲音模組可用。" if AUDIO
 import cv2
 import math
 import time
-import requests
+import smtplib
+from email.message import EmailMessage
 import numpy as np
 import json
 import os
@@ -102,11 +103,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 三端共用門檻(shared/thresholds.json):讓桌面/Pi/ESP32 用同一套數值,避免各自寫死不一致。
 def _load_shared_thresholds():
     defaults = {
-        "AUDIO_CHOKE_TH_FUSION": 0.15, "AUDIO_COUGH_RECORD_TH": 0.20,
-        "AUDIO_CHOKE_TH_SOLO": 0.32, "AUDIO_SOLO_CONFIRM": 1,
-        "COUGH_STD_TH": 18.0, "COUGH_VEL_TH": 10.0, "COUGH_CONFIRM_FRAMES": 6,
+        "AUDIO_CHOKE_TH_FUSION": 0.12, "AUDIO_COUGH_RECORD_TH": 0.18,
+        "AUDIO_CHOKE_TH_SOLO": 0.28, "AUDIO_SOLO_CONFIRM": 1,
+        "COUGH_STD_TH": 15.0, "COUGH_VEL_TH": 8.0, "COUGH_CONFIRM_FRAMES": 4,
         "POUCHING_HINT_SEC": 10.0, "ALERT_COOLDOWN_SEC": 10.0,
         "AUDIO_SAMPLE_RATE": 16000, "AUDIO_WINDOW_SEC": 0.975, "AUDIO_HOP_SEC": 0.5,
+        "GMAIL_SENDER": "", "GMAIL_APP_PASSWORD": "", "GMAIL_RECIPIENT": "",
+        "GMAIL_SMTP_HOST": "smtp.gmail.com", "GMAIL_SMTP_PORT": 465,
     }
     path = os.environ.get("ANTICHOKE_THRESHOLDS",
                           os.path.join(BASE_DIR, "shared", "thresholds.json"))
@@ -189,31 +192,56 @@ def save_eating_record(patient_id, patient_name, chew_count, status):
     threading.Thread(target=_write, daemon=True).start()
 
 # ==========================================
-# 🔒 4. LINE 通知(背景執行緒 + 冷卻)
+# 📧 4. Gmail 緊急通知(僅 L4 急性哽噎觸發,背景執行緒 + 冷卻)
 # ==========================================
-LINE_TOKEN = os.environ.get("LINE_TOKEN", "在這裡貼上你的 Channel Access Token")
+GMAIL_SENDER = (os.environ.get("GMAIL_SENDER") or SHARED_TH.get("GMAIL_SENDER") or "").strip()
+GMAIL_APP_PASSWORD = (os.environ.get("GMAIL_APP_PASSWORD") or SHARED_TH.get("GMAIL_APP_PASSWORD") or "").strip()
+GMAIL_RECIPIENT = (os.environ.get("GMAIL_RECIPIENT") or SHARED_TH.get("GMAIL_RECIPIENT") or GMAIL_SENDER).strip()
+GMAIL_SMTP_HOST = (os.environ.get("GMAIL_SMTP_HOST") or SHARED_TH.get("GMAIL_SMTP_HOST") or "smtp.gmail.com").strip()
+GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT") or SHARED_TH.get("GMAIL_SMTP_PORT") or 465)
 ALERT_COOLDOWN = SHARED_TH["ALERT_COOLDOWN_SEC"]
 _last_alert_time = {}
 
-def _line_worker(message):
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"}
+def _gmail_worker(message, sender, app_password, recipient, subject, patient_name):
     try:
-        res = requests.post(url, json={"messages": [{"type": "text", "text": message}]},
-                            headers=headers, timeout=5)
-        if res.status_code != 200:
-            print(f"❌ LINE 發送失敗: {res.status_code}, {res.text}")
+        send_l4_gmail_smtp(
+            message=message,
+            sender=sender,
+            app_password=app_password,
+            recipient=recipient,
+            subject=subject,
+            patient_name=patient_name,
+            smtp_host=GMAIL_SMTP_HOST,
+            smtp_port=GMAIL_SMTP_PORT,
+        )
+        print(f"📧 【Gmail 通知】已寄出 L4 緊急警報信件至 {recipient}")
     except Exception as e:
-        print(f"❌ LINE 連線異常: {e}")
+        print(f"❌ Gmail 發送失敗: {e}")
 
-def send_line_notification(message, alert_type="general"):
-    if not LINE_TOKEN or "貼上" in LINE_TOKEN:
-        return
+def send_gmail_notification(message, alert_type="choke_emergency",
+                            subject="L4 進食安全提醒", patient_name=None):
+    # 與線上版 (notify-l4-email) 完全對齊：僅在觸發最危險的 L4 急性哽噎時才寄送 Gmail
+    if alert_type != "choke_emergency":
+        return False
+    if external_notifications_disabled():
+        print("🛑 外部通知已停用，略過 Gmail 寄送。")
+        return False
+    sender = (os.environ.get("GMAIL_SENDER") or SHARED_TH.get("GMAIL_SENDER") or GMAIL_SENDER or "").strip()
+    app_password = (os.environ.get("GMAIL_APP_PASSWORD") or SHARED_TH.get("GMAIL_APP_PASSWORD") or GMAIL_APP_PASSWORD or "").strip()
+    recipient = (os.environ.get("GMAIL_RECIPIENT") or SHARED_TH.get("GMAIL_RECIPIENT") or GMAIL_RECIPIENT or sender).strip()
+    if not sender or not app_password or not recipient:
+        print("⚠️ 尚未設定 GMAIL_SENDER / GMAIL_APP_PASSWORD，略過 Gmail 寄送（請於 shared/thresholds.json 設定）。")
+        return False
     now = time.time()
     if now - _last_alert_time.get(alert_type, 0) < ALERT_COOLDOWN:
-        return
+        return False
     _last_alert_time[alert_type] = now
-    threading.Thread(target=_line_worker, args=(message,), daemon=True).start()
+    threading.Thread(
+        target=_gmail_worker,
+        args=(message, sender, app_password, recipient, subject, patient_name),
+        daemon=True,
+    ).start()
+    return True
 
 # ==========================================
 # 🚨 5. UI 緊急警報(橫幅 + 蜂鳴 + 彈窗,非阻塞)
@@ -266,7 +294,7 @@ AUDIO_HOP_SEC = SHARED_TH["AUDIO_HOP_SEC"]       # 每 0.5 秒分析一次
 CHOKE_KEYWORDS = ["choking", "gagging", "cough", "gasp", "wheeze", "throat"]
 SPEECH_KEYWORDS = ["speech", "conversation", "narration"]  # 用來抑制講話誤判
 
-AUDIO_CHOKE_TH_FUSION = SHARED_TH["AUDIO_CHOKE_TH_FUSION"]  # >=0.15 啟用 L4-C 嗆咳後 8 秒觀察窗
+AUDIO_CHOKE_TH_FUSION = SHARED_TH["AUDIO_CHOKE_TH_FUSION"]  # >=0.12 啟用 L4-C 嗆咳後 12 秒觀察窗
 AUDIO_COUGH_RECORD_TH = SHARED_TH["AUDIO_COUGH_RECORD_TH"]  # >=0.20 有人臉時寫入咳嗽紀錄
 AUDIO_CHOKE_TH_SOLO = SHARED_TH["AUDIO_CHOKE_TH_SOLO"]      # >=0.32 臉部遺失時單獨聲音門檻
 AUDIO_SOLO_CONFIRM = SHARED_TH["AUDIO_SOLO_CONFIRM"]        # 純聲音需連續 N 個分析窗達標
@@ -416,7 +444,7 @@ CHOKE_DOUBLE_TRIGGER_SEC = 2.5
 CHOKE_DOUBLE_GRACE_SEC = 0.9
 CHOKE_DECAY_RATE = 0.25        # TEST ONLY: slower decay to tolerate short detector dropouts
 POST_COUGH_WINDOW_SEC = 12.0   # TEST ONLY: longer cough-to-hand observation window
-BODY_SHAKE_SPEED_SUM_TH = 0.75 # 放寬掙扎晃動門檻(原 1.5 過嚴導致老人無力劇烈甩頭時無法觸發)
+BODY_SHAKE_SPEED_SUM_TH = 1.0  # 對齊實驗版：連續晃動速度總和門檻
 W_AUDIO = 2.0                  # audio_choke 乘權(0.3 分 -> 0.6)
 W_GESTURE = 0.6               # 手抓喉嚨(高特異性)
 W_CYANOSIS = 0.7             # 發紺(高特異性)
@@ -446,9 +474,12 @@ from l4_safety import (
     ChokeDoubleActionTimer,
     FaceLossWarningGuard,
     ThresholdCrossingGate,
+    build_l4_gmail_email,
     check_continuous_body_shaking,
     dispatch_visibility_warning,
     evaluate_l4_candidate,
+    external_notifications_disabled,
+    send_l4_gmail_smtp,
 )
 
 # ==========================================
@@ -731,7 +762,8 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
             # --- 身體掙扎晃動偵測 (對齊線上版 checkContinuousBodyShaking: 1.4s 視窗 + 速度 + 跨度 + 方向折返) ---
             face_size_px = math.hypot((p4.x - p152.x) * w, (p4.y - p152.y) * h)
             body_shaking = check_continuous_body_shaking(
-                body_motion_history, (p4.x, p4.y), face_size_px, current_time, w, h)
+                body_motion_history, (p4.x, p4.y), face_size_px, current_time, w, h,
+                speed_sum_threshold=BODY_SHAKE_SPEED_SUM_TH)
             prev_nose = (p4.x, p4.y)
 
             # ==========================================
@@ -857,7 +889,7 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
                     False, candidate_at_face_loss, current_time):
                 if MODE == "LIVE":
                     dispatch_visibility_warning(
-                        send_line_notification,
+                        None,
                         trigger_emergency_popup,
                         save_eating_record,
                         CURRENT_PATIENT_ID,
@@ -882,7 +914,6 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
                       and not visibility_alert_for_face_loss):
                     lost_msg = "⚠️【異常警報】進食過程中人臉消失,請確認個案狀況!"
                     print(lost_msg)
-                    send_line_notification(lost_msg, alert_type="face_lost")
                     trigger_emergency_popup("⚠️ 人臉消失警報", lost_msg)
                     face_lost_since = current_time
 
@@ -890,9 +921,9 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
         # 🚨 12. 哽噎與嗆咳決策判斷 (對齊線上版 mobile/app.js)
         #     - 路徑 A (3.0s): 身體掙扎搖晃 ＋ 撫胸/抓喉
         #     - 路徑 B (2.5s): 雙手同時抓喉/撫胸 (國際通用窒息手勢)
-        #     - 路徑 C (2.5s): 嗆咳後 8 秒內持續抓喉/撫胸
+        #     - 路徑 C (2.5s): 嗆咳後 12 秒內持續抓喉/撫胸
         #     - L1 (10.0s): 咀嚼後靜止滿 10 秒含飯/發呆提醒
-        #     - 嗆咳單獨發生：僅靜默紀錄至後台 SQLite 資料庫，不跳彈窗、不發 LINE 通知
+        #     - 嗆咳單獨發生：僅靜默紀錄至後台 SQLite 資料庫，不跳彈窗、不寄 Gmail 通知
         # ==========================================
         jaw_chewing_detected = (
             face_detected
@@ -908,7 +939,7 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
             save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
                                chew_count, "L1_含飯發呆提醒")
 
-        # ---- 先更新咳嗽/嗆咳偵測狀態，使同幀嗆咳立即賦能路徑 C (對齊線上版 YAMNet 0.15 / 0.20 / 0.32) ----
+        # ---- 先更新咳嗽/嗆咳偵測狀態，使同幀嗆咳立即賦能路徑 C (對齊敏感度測試版 YAMNet 0.12 / 0.18 / 0.28) ----
         cough_detected_this_frame = False
         if vision_cough:
             cough_detected_this_frame = True
@@ -931,7 +962,7 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
 
         if cough_detected_this_frame:
             last_cough_time = current_time
-            # 僅靜默寫入後台 SQLite 資料庫 (每 3.0 秒最多紀錄一次)，不跳警報、不閃紅橫幅、不發 LINE
+            # 僅靜默寫入後台 SQLite 資料庫 (每 3.0 秒最多紀錄一次)，不跳警報、不閃紅橫幅、不寄 Gmail
             if current_time - _last_alert_time.get("cough_db_log", 0) >= 3.0:
                 _last_alert_time["cough_db_log"] = current_time
                 save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
@@ -967,7 +998,12 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
                 reason_label = choke_timer.reason or "身體掙扎搖晃＋撫胸/抓喉"
                 gmsg = f"🚨【緊急・哽噎警報】偵測到「{reason_label}」累計達標（{CHOKE_DOUBLE_TRIGGER_SEC:.1f} 秒門檻），判定為急性哽噎！請立即協助！"
                 print(gmsg)
-                send_line_notification(gmsg, alert_type="choke_emergency")
+                if MODE == "LIVE":
+                    send_gmail_notification(
+                        gmsg,
+                        alert_type="choke_emergency",
+                        patient_name=CONFIG.get("name", "未知個案"),
+                    )
                 trigger_emergency_popup("緊急哽噎警報", gmsg)
                 save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
                                    chew_count, f"緊急哽噎警報({reason_label})")

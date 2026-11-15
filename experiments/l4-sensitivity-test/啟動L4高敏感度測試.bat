@@ -24,8 +24,11 @@ set "MODEL_ROOT=%~dp0..\.."
 if not exist "%MODEL_ROOT%\face_landmarker.task" set "MODEL_ROOT=%~dp0"
 set "ANTICHOKE_FACE_MODEL=%MODEL_ROOT%\face_landmarker.task"
 set "ANTICHOKE_HAND_MODEL=%MODEL_ROOT%\hand_landmarker.task"
-REM Suppress external LINE notifications in this test copy.
-set "LINE_TOKEN="
+REM Suppress external Gmail notifications in this test copy.
+set "ANTICHOKE_DISABLE_EXTERNAL_NOTIFICATIONS=1"
+set "GMAIL_SENDER="
+set "GMAIL_APP_PASSWORD="
+set "GMAIL_RECIPIENT="
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUNBUFFERED=1"
 set "LOG_FILE=%~dp0sensitivity-test.log"

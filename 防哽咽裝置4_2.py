@@ -3,7 +3,7 @@
 # 防哽咽即時監測 —— 主程式
 #
 # 這支程式用鏡頭看臉、用麥克風聽聲音,判斷有沒有人在吃東西時噎到。
-# 一發現可疑就警報(畫面紅色橫幅、電腦嗶嗶叫、彈窗、還會發 LINE)。
+# 一發現可疑就警報(畫面紅色橫幅、電腦嗶嗶叫、彈窗;確認 L4 急性哽噎時寄送 Gmail 緊急通知)。
 #
 # 判斷同時看好幾種線索:嘴巴開合、咀嚼、有沒有嗆咳聲(用 Google 的 YAMNet 模型)、
 # 手有沒有抓喉嚨、嘴唇有沒有發紫、以及「安靜卻不動」的無聲窒息。這些線索分別在
@@ -69,7 +69,8 @@ print("✅ 核心套件檢查通過。" + ("🎤 聲音模組可用。" if AUDIO
 import cv2
 import math
 import time
-import requests
+import smtplib
+from email.message import EmailMessage
 import numpy as np
 import json
 import os
@@ -102,9 +103,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 三端共用門檻(shared/thresholds.json):讓桌面/Pi/ESP32 用同一套數值,避免各自寫死不一致。
 def _load_shared_thresholds():
     defaults = {
-        "AUDIO_CHOKE_TH_FUSION": 0.15, "AUDIO_CHOKE_TH_SOLO": 0.35,
-        "AUDIO_SOLO_CONFIRM": 2, "ALERT_COOLDOWN_SEC": 10.0,
+        "AUDIO_CHOKE_TH_FUSION": 0.12, "AUDIO_COUGH_RECORD_TH": 0.18,
+        "AUDIO_CHOKE_TH_SOLO": 0.28, "AUDIO_SOLO_CONFIRM": 1,
+        "COUGH_STD_TH": 15.0, "COUGH_VEL_TH": 8.0, "COUGH_CONFIRM_FRAMES": 4,
+        "POUCHING_HINT_SEC": 10.0, "ALERT_COOLDOWN_SEC": 10.0,
         "AUDIO_SAMPLE_RATE": 16000, "AUDIO_WINDOW_SEC": 0.975, "AUDIO_HOP_SEC": 0.5,
+        "GMAIL_SENDER": "", "GMAIL_APP_PASSWORD": "", "GMAIL_RECIPIENT": "",
+        "GMAIL_SMTP_HOST": "smtp.gmail.com", "GMAIL_SMTP_PORT": 465,
     }
     path = os.environ.get("ANTICHOKE_THRESHOLDS",
                           os.path.join(BASE_DIR, "shared", "thresholds.json"))
@@ -187,31 +192,56 @@ def save_eating_record(patient_id, patient_name, chew_count, status):
     threading.Thread(target=_write, daemon=True).start()
 
 # ==========================================
-# 🔒 4. LINE 通知(背景執行緒 + 冷卻)
+# 📧 4. Gmail 緊急通知(僅 L4 急性哽噎觸發,背景執行緒 + 冷卻)
 # ==========================================
-LINE_TOKEN = os.environ.get("LINE_TOKEN", "在這裡貼上你的 Channel Access Token")
+GMAIL_SENDER = (os.environ.get("GMAIL_SENDER") or SHARED_TH.get("GMAIL_SENDER") or "").strip()
+GMAIL_APP_PASSWORD = (os.environ.get("GMAIL_APP_PASSWORD") or SHARED_TH.get("GMAIL_APP_PASSWORD") or "").strip()
+GMAIL_RECIPIENT = (os.environ.get("GMAIL_RECIPIENT") or SHARED_TH.get("GMAIL_RECIPIENT") or GMAIL_SENDER).strip()
+GMAIL_SMTP_HOST = (os.environ.get("GMAIL_SMTP_HOST") or SHARED_TH.get("GMAIL_SMTP_HOST") or "smtp.gmail.com").strip()
+GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT") or SHARED_TH.get("GMAIL_SMTP_PORT") or 465)
 ALERT_COOLDOWN = SHARED_TH["ALERT_COOLDOWN_SEC"]
 _last_alert_time = {}
 
-def _line_worker(message):
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"}
+def _gmail_worker(message, sender, app_password, recipient, subject, patient_name):
     try:
-        res = requests.post(url, json={"messages": [{"type": "text", "text": message}]},
-                            headers=headers, timeout=5)
-        if res.status_code != 200:
-            print(f"❌ LINE 發送失敗: {res.status_code}, {res.text}")
+        send_l4_gmail_smtp(
+            message=message,
+            sender=sender,
+            app_password=app_password,
+            recipient=recipient,
+            subject=subject,
+            patient_name=patient_name,
+            smtp_host=GMAIL_SMTP_HOST,
+            smtp_port=GMAIL_SMTP_PORT,
+        )
+        print(f"📧 【Gmail 通知】已寄出 L4 緊急警報信件至 {recipient}")
     except Exception as e:
-        print(f"❌ LINE 連線異常: {e}")
+        print(f"❌ Gmail 發送失敗: {e}")
 
-def send_line_notification(message, alert_type="general"):
-    if not LINE_TOKEN or "貼上" in LINE_TOKEN:
-        return
+def send_gmail_notification(message, alert_type="choke_emergency",
+                            subject="L4 進食安全提醒", patient_name=None):
+    # 與線上版 (notify-l4-email) 完全對齊：僅在觸發最危險的 L4 急性哽噎時才寄送 Gmail
+    if alert_type != "choke_emergency":
+        return False
+    if external_notifications_disabled():
+        print("🛑 外部通知已停用，略過 Gmail 寄送。")
+        return False
+    sender = (os.environ.get("GMAIL_SENDER") or SHARED_TH.get("GMAIL_SENDER") or GMAIL_SENDER or "").strip()
+    app_password = (os.environ.get("GMAIL_APP_PASSWORD") or SHARED_TH.get("GMAIL_APP_PASSWORD") or GMAIL_APP_PASSWORD or "").strip()
+    recipient = (os.environ.get("GMAIL_RECIPIENT") or SHARED_TH.get("GMAIL_RECIPIENT") or GMAIL_RECIPIENT or sender).strip()
+    if not sender or not app_password or not recipient:
+        print("⚠️ 尚未設定 GMAIL_SENDER / GMAIL_APP_PASSWORD，略過 Gmail 寄送（請於 shared/thresholds.json 設定）。")
+        return False
     now = time.time()
     if now - _last_alert_time.get(alert_type, 0) < ALERT_COOLDOWN:
-        return
+        return False
     _last_alert_time[alert_type] = now
-    threading.Thread(target=_line_worker, args=(message,), daemon=True).start()
+    threading.Thread(
+        target=_gmail_worker,
+        args=(message, sender, app_password, recipient, subject, patient_name),
+        daemon=True,
+    ).start()
+    return True
 
 # ==========================================
 # 🚨 5. UI 緊急警報(橫幅 + 蜂鳴 + 彈窗,非阻塞)
@@ -264,8 +294,9 @@ AUDIO_HOP_SEC = SHARED_TH["AUDIO_HOP_SEC"]       # 每 0.5 秒分析一次
 CHOKE_KEYWORDS = ["choking", "gagging", "cough", "gasp", "wheeze", "throat"]
 SPEECH_KEYWORDS = ["speech", "conversation", "narration"]  # 用來抑制講話誤判
 
-AUDIO_CHOKE_TH_FUSION = SHARED_TH["AUDIO_CHOKE_TH_FUSION"]  # 融合時聲音只要有一點跡象即可
-AUDIO_CHOKE_TH_SOLO = SHARED_TH["AUDIO_CHOKE_TH_SOLO"]      # 純聲音觸發警報的高門檻
+AUDIO_CHOKE_TH_FUSION = SHARED_TH["AUDIO_CHOKE_TH_FUSION"]  # >=0.12 啟用 L4-C 嗆咳後 12 秒觀察窗
+AUDIO_COUGH_RECORD_TH = SHARED_TH["AUDIO_COUGH_RECORD_TH"]  # >=0.20 有人臉時寫入咳嗽紀錄
+AUDIO_CHOKE_TH_SOLO = SHARED_TH["AUDIO_CHOKE_TH_SOLO"]      # >=0.32 臉部遺失時單獨聲音門檻
 AUDIO_SOLO_CONFIRM = SHARED_TH["AUDIO_SOLO_CONFIRM"]        # 純聲音需連續 N 個分析窗達標
 
 yamnet_model = None
@@ -394,9 +425,10 @@ EMA_ALPHA_MAR = 0.4
 EMA_ALPHA_JAW = 0.5
 REF_IOD_PX = 100.0
 MIN_CHEW_INTERVAL = 0.18
-COUGH_STD_TH = 15.0
-COUGH_VEL_TH = 8.0
-COUGH_CONFIRM_FRAMES = 3
+COUGH_STD_TH = float(SHARED_TH.get("COUGH_STD_TH", 18.0))
+COUGH_VEL_TH = float(SHARED_TH.get("COUGH_VEL_TH", 10.0))
+COUGH_CONFIRM_FRAMES = int(SHARED_TH.get("COUGH_CONFIRM_FRAMES", 6))
+POUCHING_HINT_SEC = float(SHARED_TH.get("POUCHING_HINT_SEC", 10.0))
 FACE_LOST_ALERT_SEC = 3.0
 
 # --- S1 無聲窒息 ---
@@ -408,6 +440,11 @@ CYANOSIS_BLUE_TH = 0.40        # 嘴唇藍佔比門檻(需現場校正)
 FUSION_WINDOW_SEC = 1.8
 FUSION_THRESHOLD = 1.0
 FUSION_COOLDOWN_SEC = 10.0
+CHOKE_DOUBLE_TRIGGER_SEC = 2.5
+CHOKE_DOUBLE_GRACE_SEC = 0.9
+CHOKE_DECAY_RATE = 0.25        # TEST ONLY: slower decay to tolerate short detector dropouts
+POST_COUGH_WINDOW_SEC = 12.0   # TEST ONLY: longer cough-to-hand observation window
+BODY_SHAKE_SPEED_SUM_TH = 1.0  # 對齊實驗版：連續晃動速度總和門檻
 W_AUDIO = 2.0                  # audio_choke 乘權(0.3 分 -> 0.6)
 W_GESTURE = 0.6               # 手抓喉嚨(高特異性)
 W_CYANOSIS = 0.7             # 發紺(高特異性)
@@ -432,6 +469,18 @@ import gesture           # 純幾何,判斷手是否接近喉嚨
 import silent_choke      # S1: 無聲窒息偵測
 import evidence_fusion   # S3: 時間窗多模態融合
 import cyanosis          # S2: 嘴唇發紺
+from l4_safety import (
+    ChewingPauseTracker,
+    ChokeDoubleActionTimer,
+    FaceLossWarningGuard,
+    ThresholdCrossingGate,
+    build_l4_gmail_email,
+    check_continuous_body_shaking,
+    dispatch_visibility_warning,
+    evaluate_l4_candidate,
+    external_notifications_disabled,
+    send_l4_gmail_smtp,
+)
 
 # ==========================================
 # 🧩 9. 啟動用工廠函數(把原本的模組層級副作用收攏成可呼叫的函數)
@@ -553,12 +602,21 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
 
     mar_smooth = None
     jaw_smooth = None
-    last_cough_time = 0.0
+    last_cough_time = -1e9
     hand_on_neck_start_time = None
-    choke_double_start_time = None
+    choke_timer = ChokeDoubleActionTimer(
+        trigger_sec=CHOKE_DOUBLE_TRIGGER_SEC,
+        grace_sec=CHOKE_DOUBLE_GRACE_SEC,
+        decay_rate=CHOKE_DECAY_RATE)
+    visibility_warning_guard = FaceLossWarningGuard(
+        grace_sec=CHOKE_DOUBLE_GRACE_SEC)
+    visibility_alert_for_face_loss = False
     last_choke_alert_time = 0.0
     prev_nose = None
     nose_speed_history = deque(maxlen=30)
+    body_motion_history = []
+    jaw_stillness_tracker = ChewingPauseTracker()
+    l1_pause_reminder_gate = ThresholdCrossingGate()
     last_hand_landmarks = []
     HAND_CONNECTIONS = [
         (0, 1), (1, 2), (2, 3), (3, 4), # Thumb
@@ -582,18 +640,22 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
     last_anchor_ts = 0.0
     ANCHOR_GRACE_SEC = 2.0
 
-    def handle_gesture(nose_xy, chin_xy):
-        """偵測手抓喉嚨與胸前區域，回傳 (near_throat, near_chest)。"""
+    def handle_gesture(nose_xy, chin_xy, min_pts=2):
+        """偵測手抓喉嚨與上胸口區域，回傳 (near_throat, near_chest, hands_in_zone)。"""
         nonlocal last_hand_landmarks
         if hand_landmarker is None:
             last_hand_landmarks = []
-            return False, False
+            return False, False, 0
         hres = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
         last_hand_landmarks = hres.hand_landmarks
         hnds = [[(pt.x, pt.y) for pt in hand] for hand in hres.hand_landmarks]
-        near_throat = gesture.hand_near_throat(hnds, nose_xy, chin_xy, w, h)
-        near_chest = gesture.hand_near_chest(hnds, nose_xy, chin_xy, w, h)
-        return near_throat, near_chest
+        zone_info = gesture.analyze_hands_in_danger_zones(
+            hnds, nose_xy, chin_xy, w, h, min_pts=min_pts)
+        return (
+            zone_info["near_throat"],
+            zone_info["near_chest"],
+            zone_info["hands_in_zone"],
+        )
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -647,11 +709,15 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
         movement_std = 0.0
         mar = 0.0
         gesture_now = False
+        hand_chest_now = False
+        hands_in_danger_zone = 0
         vision_cough = False
         body_shaking = False
 
         if face_detected:
             face_lost_since = None
+            visibility_warning_guard.update(True, False, current_time)
+            visibility_alert_for_face_loss = False
             # Tasks API 回傳扁平 list(每點有 .x/.y/.z),索引與舊版一致
             face_landmarks = results.face_landmarks[0]
             p13 = face_landmarks[13]
@@ -693,13 +759,21 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
                 # deque 不支援切片,需先轉 list 再取最後 15 筆
                 movement_std = float(np.std(list(jaw_movement_history)[-15:]))
 
+            # --- 身體掙扎晃動偵測 (對齊線上版 checkContinuousBodyShaking: 1.4s 視窗 + 速度 + 跨度 + 方向折返) ---
+            face_size_px = math.hypot((p4.x - p152.x) * w, (p4.y - p152.y) * h)
+            body_shaking = check_continuous_body_shaking(
+                body_motion_history, (p4.x, p4.y), face_size_px, current_time, w, h,
+                speed_sum_threshold=BODY_SHAKE_SPEED_SUM_TH)
+            prev_nose = (p4.x, p4.y)
+
             # ==========================================
-            # A1. 手抓喉嚨手勢偵測(國際窒息手勢,獨立於狀態機、任何狀態皆檢查)
+            # A1. 手抓喉嚨與撫胸手勢偵測(搖晃動態模糊時放寬為 >=1 關節點；平時 >=2 防單指掠過誤判)
             # ==========================================
             last_nose = (p4.x, p4.y)          # #2: 快取錨點供臉短暫消失時續用
             last_chin = (p152.x, p152.y)
             last_anchor_ts = current_time
-            gesture_now, hand_chest_now = handle_gesture(last_nose, last_chin)
+            gesture_now, hand_chest_now, hands_in_danger_zone = handle_gesture(
+                last_nose, last_chin, min_pts=1)  # TEST ONLY: higher hand sensitivity
 
             # --- 影像嗆咳跡象(連續幀確認)---
             vision_cough = False
@@ -710,16 +784,6 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
             if cough_frame_counter >= COUGH_CONFIRM_FRAMES:
                 cough_frame_counter = 0
                 vision_cough = True
-
-            # --- 身體劇烈晃動偵測 (struggling) ---
-            face_size = math.hypot(p4.x - p152.x, p4.y - p152.y)
-            if prev_nose is not None and face_size > 0.001:
-                displacement = math.hypot(p4.x - prev_nose[0], p4.y - prev_nose[1])
-                norm_disp = displacement / face_size
-                nose_speed_history.append(norm_disp)
-                if sum(nose_speed_history) > 1.5:
-                    body_shaking = True
-            prev_nose = (p4.x, p4.y)
 
             # ==========================================
             # S1. 無聲窒息 & S3. 多模態融合 (已停用彈窗，依需求一律以 5秒劇烈晃動+胸口/脖子手勢 為唯一哽噎判定)
@@ -797,15 +861,22 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
             cv2.line(frame, (int(p4.x * w), int(p4.y * h)),
                      (int(p152.x * w), int(p152.y * h)), (0, 0, 255), 2)
 
-            # 3. 繪製喉嚨偵測圈圈 (脖子範圍)
-            tx = p152.x + 0.6 * (p152.x - p4.x)
-            ty = p152.y + 0.6 * (p152.y - p4.y)
-            cx_px, cy_px = int(tx * w), int(ty * h)
-            r_px = int(face_size * 0.6 * w)
-            cv2.circle(frame, (cx_px, cy_px), r_px, (255, 0, 255), 2)
-            cv2.circle(frame, (cx_px, cy_px), 4, (255, 0, 255), -1)
-            cv2.putText(frame, "Throat Zone", (cx_px - 40, cy_px - r_px - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            # 3. 繪製喉嚨與上胸口偵測圈圈 (與 gesture.danger_zone_geometry 100% 像素對齊)
+            zone_geom = gesture.danger_zone_geometry((p4.x, p4.y), (p152.x, p152.y), w, h)
+            tx_px, ty_px = int(zone_geom["throat_center"][0]), int(zone_geom["throat_center"][1])
+            tr_px = int(zone_geom["throat_radius"])
+            throat_color = (80, 50, 255) if gesture_now else (255, 0, 255)
+            cv2.circle(frame, (tx_px, ty_px), tr_px, throat_color, 3 if gesture_now else 2)
+            cv2.circle(frame, (tx_px, ty_px), 4, throat_color, -1)
+            cv2.putText(frame, "Throat Zone", (tx_px - 45, max(15, ty_px - tr_px - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, throat_color, 1)
+
+            cx_px, cy_px = int(zone_geom["chest_center"][0]), int(zone_geom["chest_center"][1])
+            cr_px = int(zone_geom["chest_radius"])
+            chest_color = (80, 50, 255) if hand_chest_now else (255, 200, 56)
+            cv2.circle(frame, (cx_px, cy_px), cr_px, chest_color, 3 if hand_chest_now else 2)
+            cv2.putText(frame, "Chest Zone", (cx_px - 45, max(15, cy_px - cr_px - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, chest_color, 1)
 
             if current_state == ST_SWALLOW:
                 cv2.putText(frame, "SWALLOWING...", (20, h - 70),
@@ -813,55 +884,77 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
         else:
             cv2.putText(frame, "NO FACE DETECTED", (140, int(h / 2)),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+            candidate_at_face_loss = choke_timer.active and choke_timer.duration > 0.0
+            if visibility_warning_guard.update(
+                    False, candidate_at_face_loss, current_time):
+                if MODE == "LIVE":
+                    dispatch_visibility_warning(
+                        None,
+                        trigger_emergency_popup,
+                        save_eating_record,
+                        CURRENT_PATIENT_ID,
+                        CONFIG.get("name", "未知個案"),
+                        chew_count)
+                    visibility_alert_for_face_loss = True
             # #2: 臉短暫消失時(如病人低頭嗆咳),若手仍可見,用快取錨點續抓手勢
             gesture_now = False
             hand_chest_now = False
+            hands_in_danger_zone = 0
             if last_nose is not None and (current_time - last_anchor_ts) < ANCHOR_GRACE_SEC:
-                gesture_now, hand_chest_now = handle_gesture(last_nose, last_chin)
+                gesture_now, hand_chest_now, hands_in_danger_zone = handle_gesture(
+                    last_nose, last_chin, min_pts=2)
             prev_nose = None
             nose_speed_history.clear()
+            body_motion_history.clear()
             body_shaking = False
             if MODE == "LIVE" and current_state in (ST_INGEST, ST_CHEW, ST_SWALLOW):
                 if face_lost_since is None:
                     face_lost_since = current_time
-                elif current_time - face_lost_since > FACE_LOST_ALERT_SEC:
+                elif (current_time - face_lost_since > FACE_LOST_ALERT_SEC
+                      and not visibility_alert_for_face_loss):
                     lost_msg = "⚠️【異常警報】進食過程中人臉消失,請確認個案狀況!"
                     print(lost_msg)
-                    send_line_notification(lost_msg, alert_type="face_lost")
                     trigger_emergency_popup("⚠️ 人臉消失警報", lost_msg)
                     face_lost_since = current_time
 
         # ==========================================
-        # 🚨 12. 哽噎與嗆咳決策判斷
-        #     - 哽咽：身體搖晃 ＋ 手在胸前核心區域 雙重動作同時持續 5 秒 -> 緊急哽噎警報
-        #     - 嗆咳：咳嗽/嗆咳僅紀錄至後台 SQLite 資料庫，不跳彈窗、不閃紅橫幅、不發 LINE 通知
+        # 🚨 12. 哽噎與嗆咳決策判斷 (對齊線上版 mobile/app.js)
+        #     - 路徑 A (3.0s): 身體掙扎搖晃 ＋ 撫胸/抓喉
+        #     - 路徑 B (2.5s): 雙手同時抓喉/撫胸 (國際通用窒息手勢)
+        #     - 路徑 C (2.5s): 嗆咳後 12 秒內持續抓喉/撫胸
+        #     - L1 (10.0s): 咀嚼後靜止滿 10 秒含飯/發呆提醒
+        #     - 嗆咳單獨發生：僅靜默紀錄至後台 SQLite 資料庫，不跳彈窗、不寄 Gmail 通知
         # ==========================================
-        # ---- 追蹤哽咽雙重動作 (動作一：身體前後左右搖晃 ＋ 動作二：胸前手勢) ----
-        choke_double_active = body_shaking and (hand_chest_now or gesture_now)
+        jaw_chewing_detected = (
+            face_detected
+            and current_state == ST_CHEW
+            and movement_std > CONFIG["CHEW_WAVE_THRESHOLD"]
+            and abs(jaw_velocity) > 1.5
+        )
+        jaw_still_time = jaw_stillness_tracker.update(
+            True, face_detected, jaw_chewing_detected, current_time)
+        if l1_pause_reminder_gate.update(jaw_still_time, POUCHING_HINT_SEC):
+            l1_msg = f"🟡【L1 含飯/發呆提醒】長者已靜止 {POUCHING_HINT_SEC:.0f} 秒未咀嚼，請記得嚼一嚼吞下來喔！"
+            print(l1_msg)
+            save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
+                               chew_count, "L1_含飯發呆提醒")
 
-        if choke_double_active:
-            if choke_double_start_time is None:
-                choke_double_start_time = current_time
-            choke_double_duration = current_time - choke_double_start_time
-        else:
-            choke_double_start_time = None
-            choke_double_duration = 0.0
-
-        # ---- 追蹤咳嗽/嗆咳偵測狀態 (聲音或影像) ----
+        # ---- 先更新咳嗽/嗆咳偵測狀態，使同幀嗆咳立即賦能路徑 C (對齊敏感度測試版 YAMNet 0.12 / 0.18 / 0.28) ----
         cough_detected_this_frame = False
         if vision_cough:
             cough_detected_this_frame = True
 
         audio_cough_detected = False
         if AUDIO_AVAILABLE:
-            if audio_choke > AUDIO_CHOKE_TH_SOLO:
+            if audio_choke >= AUDIO_CHOKE_TH_FUSION:
+                last_cough_time = current_time
+            record_th = AUDIO_COUGH_RECORD_TH if face_detected else AUDIO_CHOKE_TH_SOLO
+            if audio_choke >= record_th:
                 audio_solo_counter += 1
             else:
                 audio_solo_counter = 0
             if audio_solo_counter >= AUDIO_SOLO_CONFIRM:
                 audio_solo_counter = 0
-                audio_cough_detected = True
-            elif face_detected and audio_choke > AUDIO_CHOKE_TH_FUSION:
                 audio_cough_detected = True
 
         if audio_cough_detected:
@@ -869,24 +962,52 @@ def run_loop(cap, face_landmarker, hand_landmarker, CONFIG, AUDIO_AVAILABLE, MOD
 
         if cough_detected_this_frame:
             last_cough_time = current_time
-            # 僅靜默寫入後台 SQLite 資料庫 (每 3.0 秒最多紀錄一次)，不跳警報、不閃紅橫幅、不發 LINE
+            # 僅靜默寫入後台 SQLite 資料庫 (每 3.0 秒最多紀錄一次)，不跳警報、不閃紅橫幅、不寄 Gmail
             if current_time - _last_alert_time.get("cough_db_log", 0) >= 3.0:
                 _last_alert_time["cough_db_log"] = current_time
                 save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
                                    chew_count, "嗆咳紀錄")
 
-        # ---- 警報決策：哽咽緊急警報 (雙重動作同時持續滿 5.0 秒) ----
-        if choke_double_duration >= 5.0:
+        # ---- 評估三路徑 L4 候選並透過漏桶計時器累積 ----
+        recent_cough = (current_time - last_cough_time) <= POST_COUGH_WINDOW_SEC
+        choke_double_active, choke_rate, choke_reason = evaluate_l4_candidate(
+            body_shaking=body_shaking,
+            near_throat=gesture_now,
+            near_chest=hand_chest_now,
+            hands_in_zone=hands_in_danger_zone,
+            recent_cough=recent_cough,
+        )
+        choke_timer.set_step_context(rate=choke_rate, reason=choke_reason)
+        choke_double_duration = choke_timer.update(
+            choke_double_active, current_time)
+
+        if choke_double_duration > 0.0:
+            prog = min(1.0, choke_double_duration / CHOKE_DOUBLE_TRIGGER_SEC)
+            bar_color = (0, 0, 255) if prog >= 0.75 else (0, 180, 255)
+            cv2.putText(
+                frame,
+                f"L4 Choke Risk: {choke_double_duration:.1f}s / {CHOKE_DOUBLE_TRIGGER_SEC:.1f}s",
+                (20, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
+            cv2.rectangle(frame, (20, 255), (20 + int(220 * prog), 267), bar_color, -1)
+            cv2.rectangle(frame, (20, 255), (240, 267), (200, 200, 200), 1)
+
+        # ---- 警報決策：L4 急性哽噎緊急警報 ----
+        if choke_timer.reached_trigger():
             if current_time - last_choke_alert_time >= FUSION_COOLDOWN_SEC:
                 last_choke_alert_time = current_time
-                gmsg = "🚨【緊急・哽噎警報】偵測到身體連續搖晃與手部撫胸/拍胸雙重動作同時持續 5.0 秒，判定為急性哽噎！請立即協助！"
+                reason_label = choke_timer.reason or "身體掙扎搖晃＋撫胸/抓喉"
+                gmsg = f"🚨【緊急・哽噎警報】偵測到「{reason_label}」累計達標（{CHOKE_DOUBLE_TRIGGER_SEC:.1f} 秒門檻），判定為急性哽噎！請立即協助！"
                 print(gmsg)
-                send_line_notification(gmsg, alert_type="choke_emergency")
+                if MODE == "LIVE":
+                    send_gmail_notification(
+                        gmsg,
+                        alert_type="choke_emergency",
+                        patient_name=CONFIG.get("name", "未知個案"),
+                    )
                 trigger_emergency_popup("緊急哽噎警報", gmsg)
                 save_eating_record(CURRENT_PATIENT_ID, CONFIG.get("name", "未知個案"),
-                                   chew_count, "緊急哽噎警報(雙重動作5秒)")
-                choke_double_start_time = None
-                choke_double_duration = 0.0
+                                   chew_count, f"緊急哽噎警報({reason_label})")
+                choke_timer.reset()
 
         # ---- 共用資訊面板 ----
         mode_tag = "LIVE" if MODE == "LIVE" else "FILE"

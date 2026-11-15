@@ -18,7 +18,7 @@
 
 1. 在此資料夾依序執行 `1_建立虛擬環境.bat`、`2_安裝套件.bat`。
 2. 雙擊 `啟動L4高敏感度測試.bat`。
-3. 啟動器會清空 `LINE_TOKEN`，避免傳送真實 LINE 通知；本機警報視窗／蜂鳴仍可能出現。
+3. 啟動器會清空 `GMAIL_SENDER`、`GMAIL_APP_PASSWORD`、`GMAIL_RECIPIENT`，並設置 `ANTICHOKE_DISABLE_EXTERNAL_NOTIFICATIONS=1`，避免測試誤寄真實 Gmail；本機警報視窗／蜂鳴仍可能出現。
 4. 結束後若有錯誤，查看 `sensitivity-test.log`。
 
 啟動器優先使用此 repo 根目錄的 `face_landmarker.task` 和 `hand_landmarker.task`；若沒有，才使用本資料夾內的模型檔。首次音訊啟動可能需要網路下載 YAMNet 模型。

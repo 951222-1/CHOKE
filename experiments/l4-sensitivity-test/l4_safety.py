@@ -1,16 +1,32 @@
-"""Pure L4 timing, leaky-bucket accumulation, multi-path triggers, and face-visibility guards."""
+"""Pure L4 timing, leaky-bucket accumulation, multi-path triggers, face-visibility guards, and L4 Gmail SMTP dispatch."""
 
+from email.message import EmailMessage
 import math
+import os
+import smtplib
+import time
+
+
+_NOTIFICATION_DISABLE_ENV = "ANTICHOKE_DISABLE_EXTERNAL_NOTIFICATIONS"
+
+
+def external_notifications_disabled():
+    """Return True when a test/demo process must not contact external services."""
+    return os.environ.get(_NOTIFICATION_DISABLE_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 def evaluate_l4_candidate(body_shaking, near_throat, near_chest,
                           hands_in_zone=0, recent_cough=False):
     """Evaluate the 3 high-specificity clinical L4 choking paths.
 
-    Returns (active: bool, rate: float, reason: str | None) relative to a 3.0s trigger:
-      - Path B (2.5s -> rate 1.2): Both hands simultaneously in throat/chest zone.
-      - Path C (2.5s -> rate 1.2): Recent cough (<= 8s) + hand clutching throat/chest.
-      - Path A (3.0s -> rate 1.0): Moderate body shaking/struggling + hand in throat/chest.
+    Returns (active: bool, rate: float, reason: str | None). The active
+    sensitivity profile uses a 2.5s timer, with rate 1.2 for the more specific
+    two-hand and post-cough paths, and rate 1.0 for the body-shaking path.
+      - Path B: Both hands simultaneously in throat/chest zone.
+      - Path C: Recent cough (<= 12s) + hand clutching throat/chest.
+      - Path A: Moderate body shaking/struggling + hand in throat/chest.
     """
     hands_count = int(hands_in_zone or 0)
     hand_in_zone = bool(near_throat or near_chest or hands_count >= 1)
@@ -163,13 +179,18 @@ class FaceLossWarningGuard:
 
 def dispatch_visibility_warning(send_notification, show_alert, record_event,
                                 patient_id, patient_name, chew_count):
-    """Send a distinct unconfirmed visibility notice through injected sinks."""
+    """Send a distinct unconfirmed visibility notice through injected sinks.
+
+    Note: External notification (Gmail) is strictly reserved for confirmed L4 choking,
+    so send_notification may be None (or a callback that filters out choke_visibility).
+    """
     title = "⚠️ 目視確認：畫面遮蔽"
     message = (
         "⚠️【疑似哽噎，尚未確認】偵測到身體晃動與胸前手勢後，"
         "人臉畫面中斷，無法確認哽噎。請立即目視確認個案狀況。"
     )
-    send_notification(message, alert_type="choke_visibility")
+    if callable(send_notification):
+        send_notification(message, alert_type="choke_visibility")
     show_alert(title, message)
     record_event(
         patient_id, patient_name, chew_count, "疑似哽噎_視覺遮蔽需確認"
@@ -220,7 +241,8 @@ def count_direction_reversals(positions, min_excursion=3.0):
     return reversals
 
 
-def check_continuous_body_shaking(body_motion_history, nose, face_size, current_time, w, h):
+def check_continuous_body_shaking(body_motion_history, nose, face_size, current_time,
+                                  w, h, speed_sum_threshold=1.0):
     """Evaluate continuous struggling/body shaking (aligned with mobile/app.js)."""
     if not nose or face_size is None or face_size <= 0:
         return False
@@ -265,9 +287,12 @@ def check_continuous_body_shaking(body_motion_history, nose, face_size, current_
     y_span = (max_y - min_y) * h / face_size
     size_span = (max_size - min_size) / face_size
 
+    speed_threshold = float(speed_sum_threshold)
+    if not math.isfinite(speed_threshold) or speed_threshold < 0:
+        raise ValueError("speed_sum_threshold must be a finite non-negative number")
     has_direction_reversal = (x_reversals >= 1 or y_reversals >= 1 or size_span > 0.12)
     has_significant_span = (x_span > 0.10 or y_span > 0.10 or size_span > 0.10)
-    has_sustained_speed = (total_speed > 1.0)
+    has_sustained_speed = total_speed > speed_threshold
 
     return bool(has_significant_span and has_sustained_speed and has_direction_reversal)
 
@@ -341,3 +366,51 @@ class ChewingPauseTracker:
         self._previous_frame_face_visible = True
         return self._elapsed_sec
 
+
+def build_l4_gmail_email(message, sender, recipient=None,
+                         subject="L4 進食安全提醒", patient_name=None,
+                         timestamp_str=None):
+    """Build an EmailMessage for an L4 acute choking emergency alert (aligned with notify-l4-email)."""
+    clean_sender = (sender or "").strip()
+    clean_recipient = (recipient or clean_sender).strip()
+    now_str = timestamp_str or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    patient_line = f"個案名稱：{patient_name}\n" if patient_name else ""
+    body = (
+        "系統偵測到 L4 進食安全緊急事件，請立即查看個案狀況。\n\n"
+        "警報等級：L4（急性哽噎緊急警報）\n"
+        f"{patient_line}"
+        f"觸發時間：{now_str}\n"
+        f"詳細內容：{message}\n"
+    )
+    email_msg = EmailMessage()
+    email_msg["Subject"] = subject
+    email_msg["From"] = clean_sender
+    email_msg["To"] = clean_recipient
+    email_msg.set_content(body)
+    return email_msg
+
+
+def send_l4_gmail_smtp(message, sender, app_password, recipient=None,
+                       subject="L4 進食安全提醒", patient_name=None,
+                       smtp_host="smtp.gmail.com", smtp_port=465,
+                       smtp_factory=smtplib.SMTP_SSL):
+    """Send an L4 emergency alert email via Gmail SMTP_SSL."""
+    if external_notifications_disabled():
+        return False
+    clean_sender = (sender or "").strip()
+    clean_password = (app_password or "").replace(" ", "").strip()
+    clean_recipient = (recipient or clean_sender).strip()
+    if not clean_sender or not clean_password or not clean_recipient:
+        return False
+
+    email_msg = build_l4_gmail_email(
+        message=message,
+        sender=clean_sender,
+        recipient=clean_recipient,
+        subject=subject,
+        patient_name=patient_name,
+    )
+    with smtp_factory(smtp_host, int(smtp_port), timeout=10) as smtp:
+        smtp.login(clean_sender, clean_password)
+        smtp.send_message(email_msg)
+    return True
